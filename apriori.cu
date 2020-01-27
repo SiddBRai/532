@@ -19,10 +19,9 @@ typedef struct trans_node {
 } TransNode;
 
 typedef struct {
-	//char Storecode[64];
 	int trans_no;
     int item_size;
-    int item_code[256];
+    int item_code[1024];
 } Transaction;
 
 typedef struct {
@@ -38,6 +37,11 @@ typedef struct {
 	int item_set_code[256];
     int trans_array_size;
     int trans_array[256];
+
+    /* the indices of previous sets */
+    int set1_index;
+    int set2_index;
+
 } ItemSet;
 
 
@@ -85,6 +89,72 @@ void select_with_min_support(int num_items, Item* itemArray, int min_support, It
     }
 }
 
+
+__device__
+bool alreadyHasTrans(ItemSet* _item_set, int trans_no)
+{
+    bool has = false;
+    for (int i = 0; i < _item_set->trans_array_size; i++ ) {
+        if (_item_set->trans_array[i] == trans_no) {
+            has = true;
+        }
+    }
+    return has;
+}
+
+/* search for transactions in the previous itemset, updating the transaction records
+    and returning the count */
+__device__
+int find_support_count_for_itemset(ItemSet* candidate_itemset, ItemSet* checked_itemset, Transaction* trans_array)
+{
+    int count = 0;
+    for (int i = 0; i < checked_itemset->trans_array_size; i++) {
+        int trans_idx = checked_itemset->trans_array[i];
+        Transaction* trans = &(trans_array[trans_idx]);
+        bool itemset_found = true;
+        int trans_no = -1;
+        for (int j = 0; j < candidate_itemset->item_set_size; j++) {
+            int target_item_code = candidate_itemset->item_set_code[j];
+            bool single_item_found = false;
+            for (int k = 0; k < trans->item_size; k++) {
+                if (target_item_code == trans->item_code[k] && 
+                    !alreadyHasTrans(candidate_itemset, trans_idx)) {
+                    single_item_found = true; 
+                    trans_no = trans_idx;
+                    break;
+                }
+            }
+            itemset_found &= single_item_found;
+        }
+        if (itemset_found) {
+            candidate_itemset->trans_array[candidate_itemset->trans_array_size++] = trans_no;
+            count++;
+        }
+    }
+    return count;
+}
+
+__global__
+void find_support_count(int* candidateSetSize, ItemSet* candidateSet, int* globalIdx, ItemSet* currSet, Transaction* trans_array)
+{
+    int tid = blockIdx.x*blockDim.x + threadIdx.x;
+    int num_threads = gridDim.x * blockDim.x;
+    int i = tid;
+    
+    while (i < *candidateSetSize) {
+        int set1_idx = candidateSet[i].set1_index;
+        int set2_idx = candidateSet[i].set2_index;
+        int count1 = find_support_count_for_itemset(&(candidateSet[i]), &(currSet[set1_idx]), trans_array);
+        int count2 = find_support_count_for_itemset(&(candidateSet[i]), &(currSet[set2_idx]), trans_array);
+        
+        int _global_idx = atomicAdd(globalIdx, 1);
+        candidateSet[_global_idx].freq = count1 + count2;
+
+        i += num_threads;
+    }
+
+}
+
 int itemsetComp(const void* a, const void* b)
 {
     ItemSet* set_a = (ItemSet*)(a);
@@ -124,7 +194,7 @@ int find_last_eq_class_item(int array_size, ItemSet* itemset_array, int base_pos
     return last_pos;
 }
 
-void* genNextCardi(int itemset_array_size, ItemSet* curr_itemset_array, int nextCardinality)
+void* genNextItemSetArray(int itemset_array_size, ItemSet* curr_itemset_array, int nextCardinality, int* nextSize)
 {
     int _arr_size = itemset_array_size;
     int new_idx = 0;
@@ -146,9 +216,15 @@ void* genNextCardi(int itemset_array_size, ItemSet* curr_itemset_array, int next
                 next_set[new_idx].item_set_size = nextCardinality;
                 next_set[new_idx].item_set_code[0] = curr_itemset_array[i].item_set_code[0];
                 next_set[new_idx].item_set_code[1] = curr_itemset_array[j].item_set_code[0];
+                
+                /* store the indices */
+                next_set[new_idx].set1_index = i;
+                next_set[new_idx].set2_index = j;
+
                 new_idx++;
             }
         }
+        *nextSize = next_size;
     }
     else {
         int i = 0;
@@ -183,13 +259,18 @@ void* genNextCardi(int itemset_array_size, ItemSet* curr_itemset_array, int next
                     
                     next_set[new_idx].item_set_code[nextCardinality-1] = curr_itemset_array[end_pos].item_set_code[nextCardinality-2];
                     
+                    /* store the indices */
+                    next_set[new_idx].set1_index = start_pos;
+                    next_set[new_idx].set2_index = end_pos;
+    
                     new_idx++; 
                 }
             }
         }
+        *nextSize = next_size;
     }
 
-    return NULL;
+    return (void*)next_set;
 }
 
 int main(void) 
@@ -278,13 +359,53 @@ int main(void)
     /* Now we get the transposed database that every item set with size 1 has a corresponding list of transactions */
     /* Generate itemset with size 2 */
     
-    
     int cardinality = 2;
+    int currSetSize = item_count;
+    int candidateSetSize = 0;
+    int *dev_candidateSetSize = NULL;
+    ItemSet* currSet = itemsetArray;
+    ItemSet* dev_currSet = NULL;
+    ItemSet* candidateSet = NULL;
+    ItemSet* dev_candidateSet = NULL;
+
+    cudaMalloc(&dev_candidateSetSize, sizeof(int));
+
     while (true) {
-              
+        candidateSet = (ItemSet*)genNextItemSetArray(currSetSize, currSet, cardinality, &candidateSetSize);
+        if (candidateSetSize == 0) {
+            break;
+        }
+        assert(candidateSet != NULL);          
+        
+        /* allocate GPU kernel memory */
+        cudaMemcpy(dev_candidateSetSize, &candidateSetSize, sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(dev_globalIdx, &globalIdx, sizeof(int), cudaMemcpyHostToDevice);
+        //cudaMalloc(&dev_currSet, currSetSize*sizeof(ItemSet));
+        //cudaMemcpy(dev_currSet, currSet, currSetSize*sizeof(ItemSet), cudaMemcpyHostToDevice);
+        cudaMalloc(&dev_candidateSet, candidateSetSize*sizeof(ItemSet));
+        cudaMemcpy(dev_candidateSet, candidateSet, candidateSetSize*sizeof(ItemSet), cudaMemcpyHostToDevice);        
+        
+        /* launch the kernel */
+        find_support_count<<<gridSize, blockSize>>>(dev_candidateSetSize, 
+                                                     dev_candidateSet, 
+                                                     dev_globalIdx, 
+                                                     dev_currSet, 
+                                                     dev_transArray);
 
+        /* copy the result back */
+        cudaMemcpy(candidateSet, dev_candidateSet, candidateSetSize*sizeof(ItemSet), cudaMemcpyDeviceToHost);
+
+        /* update the parameters and free previously used memory */
+        free(currSet);
+        cudaFree(dev_currSet);
+        cardinality++;
+        currSet = candidateSet;
+        currSetSize = candidateSetSize;
+        dev_currSet = dev_candidateSet; 
+        globalIdx = 0;
     }
-
+    
+    /* Finally Generate association rules */
 
     return 0;
 }
