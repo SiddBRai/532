@@ -44,6 +44,11 @@ typedef struct {
 
 } ItemSet;
 
+typedef struct {
+    int freq;
+    int count;
+    int *item_code_array;
+} SupportCount;
 
 #define TRANS_NUM 600000
 #define NUM_THREADS 16
@@ -135,7 +140,7 @@ int find_support_count_for_itemset(ItemSet* candidate_itemset, ItemSet* checked_
 }
 
 __global__
-void find_support_count(int* candidateSetSize, ItemSet* candidateSet, int* globalIdx, ItemSet* currSet, Transaction* trans_array)
+void find_support_count(int* candidateSetSize, ItemSet* candidateSet, int* globalIdx, ItemSet* currSet, Transaction* trans_array, int min_support)
 {
     int tid = blockIdx.x*blockDim.x + threadIdx.x;
     int num_threads = gridDim.x * blockDim.x;
@@ -146,10 +151,11 @@ void find_support_count(int* candidateSetSize, ItemSet* candidateSet, int* globa
         int set2_idx = candidateSet[i].set2_index;
         int count1 = find_support_count_for_itemset(&(candidateSet[i]), &(currSet[set1_idx]), trans_array);
         int count2 = find_support_count_for_itemset(&(candidateSet[i]), &(currSet[set2_idx]), trans_array);
-        
-        int _global_idx = atomicAdd(globalIdx, 1);
-        candidateSet[_global_idx].freq = count1 + count2;
-
+        /* check with minimum spport */ 
+        if (count1 + count2 >= min_support) {
+            int _global_idx = atomicAdd(globalIdx, 1);
+            candidateSet[_global_idx].freq = count1 + count2;
+        }
         i += num_threads;
     }
 
@@ -279,6 +285,7 @@ int main(void)
     string line;
     unordered_map<string, int> item_code_map;
     unordered_map<int, int> transaction_map;
+    vector<SupportCount> support_count_vec;
 
     int trans_count = 0;    /* number of transactions */
     int item_count = 0;     /* number of unique items */
@@ -355,7 +362,22 @@ int main(void)
 
     cudaMemcpy(itemsetArray, dev_itemsetArray, item_count*sizeof(ItemSet), cudaMemcpyDeviceToHost);
     cudaMemcpy(&globalIdx, dev_globalIdx, sizeof(int), cudaMemcpyDeviceToHost);
+     
+    /* Record in Support Count */
+    auto sc_record_func = [](vector<SupportCount>& vec, int itemset_count, ItemSet* itemset_array)
+    {
+        for (int is_idx = 0; is_idx < itemset_count; is_idx++) {
+            SupportCount sc;
+            sc.freq = itemset_array[is_idx].freq;
+            sc.count = itemset_array[is_idx].item_set_size;
+            sc.item_code_array = (int*)malloc(sc.count * sizeof(int));
+            memcpy(sc.item_code_array, itemset_array[is_idx].item_set_code, sc.count*sizeof(int));
+            vec.push_back(sc);
+        }
+    };   
     
+    sc_record_func(support_count_vec, item_count, itemsetArray);
+
     /* Now we get the transposed database that every item set with size 1 has a corresponding list of transactions */
     /* Generate itemset with size 2 */
     
@@ -390,10 +412,14 @@ int main(void)
                                                      dev_candidateSet, 
                                                      dev_globalIdx, 
                                                      dev_currSet, 
-                                                     dev_transArray);
+                                                     dev_transArray,
+                                                     min_support);
 
         /* copy the result back */
         cudaMemcpy(candidateSet, dev_candidateSet, candidateSetSize*sizeof(ItemSet), cudaMemcpyDeviceToHost);
+        
+        /* Make statistics for support count */
+        sc_record_func(support_count_vec, candidateSetSize, candidateSet);
 
         /* update the parameters and free previously used memory */
         free(currSet);
@@ -405,7 +431,29 @@ int main(void)
         globalIdx = 0;
     }
     
-    /* Finally Generate association rules */
+    /* Finally generate association rules */
+    auto find_support_count = [](vector<SupportCount>& vec, ItemSet* itemset)->int
+    {
+        int _size = itemset->item_set_size;
+        for (auto sc : vec) {
+            if (sc.count != _size) continue;
+            if (memcmp(itemset->item_set_code, sc.item_code_array, _size) != 0) continue;
+            return sc.freq;
+        }
+        return 0;
+    };
+    
+    auto getRules = [](ItemSet* itemset, int size, vector<SupportCount>& vec)
+    {
+
+    };
+
+    for (int idx = 0; idx < currSetSize; idx++) {
+        ItemSet* item_set = &currSet[idx];
+        for (int _size = 1; _size <= item_set->item_set_size; _size++) {
+            getRules(item_set, _size, support_count_vec);
+        }
+    }
 
     return 0;
 }
