@@ -9,6 +9,7 @@
 #include <iostream>
 #include <fstream>
 #include <numeric>
+#include <functional>
 
 //#include "lock.h"
 
@@ -432,7 +433,7 @@ int main(void)
     }
     
     /* Finally generate association rules */
-    auto find_support_count = [](vector<SupportCount>& vec, ItemSet* itemset)->int
+    auto get_support_count = [](vector<SupportCount>& vec, ItemSet* itemset)->int
     {
         int _size = itemset->item_set_size;
         for (auto sc : vec) {
@@ -443,9 +444,34 @@ int main(void)
         return 0;
     };
     
-    auto getRules = [](ItemSet* itemset, int size, vector<SupportCount>& vec)
+    function<void(ItemSet*, int, int, int, ItemSet*, vector<SupportCount>&)> get_rules_per_size;
+    get_rules_per_size = [&get_support_count, &get_rules_per_size](ItemSet* sub_itemset, int array_index, int size, int start_pos, ItemSet* itemset, vector<SupportCount>& vec)
     {
+        if (array_index == size) {
+            int _support_count = get_support_count(vec, sub_itemset);
+            /* now we can calculate the confidence */
+            float confidence = (float)(_support_count) / (float)(itemset->freq);
+        }
+        sub_itemset->item_set_code[array_index] = itemset->item_set_code[start_pos];
+        for (int next_pos = start_pos+1; next_pos < itemset->item_set_size; next_pos++) {
+            get_rules_per_size(sub_itemset, array_index+1, size, next_pos, itemset, vec);
+        }
+    };
 
+    
+    auto getRules = [&get_rules_per_size](ItemSet* itemset, int size, vector<SupportCount>& vec)
+    {
+        //int *_code_array = (int*)malloc(size*sizeof(int));
+        ItemSet *sub_itemset = (ItemSet*)malloc(sizeof(ItemSet));
+        memset(sub_itemset, 0, sizeof(ItemSet));
+        sub_itemset->item_set_size = size;
+        
+        int array_index = 0;
+        for (int start_pos = 0; start_pos < itemset->item_set_size; start_pos++) {
+            get_rules_per_size(sub_itemset, array_index, size, start_pos, itemset, vec);
+        }
+
+        //free(_code_array);
     };
 
     for (int idx = 0; idx < currSetSize; idx++) {
